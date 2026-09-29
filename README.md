@@ -60,7 +60,7 @@ homework runner.
                         ┌─────────────────────────────────────────────┐
                         │  build_chain()  (created once)              │
                         │  ChatDeepSeek(model="deepseek-v4-flash-     │
-                        │  vision-exp", temperature=0)                │
+                        │  vision-exp", temperature=0.2)              │
                         └──────────────────┬──────────────────────────┘
                                            │  prompt | llm  (LCEL chain)
                         ┌──────────────────▼──────────────────────────┐
@@ -68,17 +68,21 @@ homework runner.
    receipt2.jpg ──► image_data_url() ──► │ multimodal human prompt │  │
        ...         (base64 data URL) ──► │ + receipt image         │  │
    receiptN.jpg ──► image_data_url() ──► └───────────┬─────────────┘  │
-                                           chain.batch() (parallel,  │
-                                           max_concurrency=4)        │
+                                           parallel reads (4 threads) │
                                            │ JSON per receipt         │
                         ┌──────────────────▼──────────────────────────┐
                         │  Per-receipt extraction (Stage 1)           │
                         │  {subtotal_after_discounts, discounts[],    │
-                        │   discount_total, rounding, amount_paid}    │
+                        │   discount_total, rounding, amount_paid,    │
+                        │   positive_lines[]}                         │
                         └───────────────┬─────────────────────────────┘
-        ┌── parse & validate ── fail? ──► retry that receipt only     │
-        │    (JSON parse, amounts > 0, |rounding| <= 0.10,            │
-        │     paid == subtotal + rounding +/- 0.01; up to 4 tries)    │
+        ┌─ parse & validate every read ──► drop reads that fail:     │
+        │   · JSON parse, amounts > 0, |rounding| <= 0.10            │
+        │   · printed identities (+-HK$0.01):                        │
+        │     amount_paid = subtotal + rounding                      │
+        │     sum(positive_lines) - discount_total = subtotal        │
+        ├─ majority vote per field (2 of N reads, 0.005 tol.)        │
+        └─ receipt not agreed? re-read it (max 5 reads, parallel)    │
         ▼                                                             │
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Deterministic aggregation (Stage 2, in Python, no LLM involved)     │
@@ -93,28 +97,31 @@ homework runner.
 ### Solution description
 
 The design follows one principle: **let the vision model do what it is good at
-(reading numbers off paper) and let code do what code is good at (arithmetic
-and validation)**. `build_chain()` instantiates a single
-`ChatDeepSeek(model="deepseek-v4-flash-vision-exp", temperature=0)` and a
+(reading numbers off paper) and let code do what code is good at (arithmetic,
+validation, and voting)**. `build_chain()` instantiates a single
+`ChatDeepSeek(model="deepseek-v4-flash-vision-exp", temperature=0.2)` and a
 `ChatPromptTemplate` whose human message carries one receipt image (as a base64
 data URL via the provided `image_data_url()` helper) together with very
 specific extraction instructions: report the printed SUBTOTAL/小計 line (after
 discounts, before rounding), every discount/coupon/promotion line as a positive
-amount (excluding ROUNDING), the ROUNDING line itself, and the final payment
-line (OCTOPUS/CASH/CARD after ROUNDING), while explicitly ignoring card
-numbers, member points, quantities, the change (找續) line and the Octopus
-remaining-balance (餘額) line. In `answer_queries()`, all receipts are first
-processed in parallel with `chain.batch()`; each returned JSON is parsed with
-`parse_float=Decimal` and passed through sanity checks — amounts positive,
-`|rounding| ≤ 0.10` (HK receipts round to the nearest 10 cents), and the
-identity `amount_paid = subtotal_after_discounts + rounding` within one cent.
-Any receipt that fails is re-read individually up to four times, so one OCR
-mistake can never corrupt the final answer. Finally the per-receipt figures are
-summed with `Decimal` into the two folder-level totals and formatted as
-`HK$XXXX.XX`, guaranteeing each response contains exactly one numeric amount.
-Because aggregation is deterministic, accuracy depends only on per-receipt
-extraction, and the retry + validation loop makes that extraction robust across
-unseen receipts.
+amount (excluding ROUNDING), the ROUNDING line, the final payment line
+(OCTOPUS/CASH/CARD after ROUNDING), and every positive amount line above the
+subtotal - while explicitly ignoring card numbers, member points, the change
+(找續) line and the Octopus remaining-balance (餘額) line. In
+`answer_queries()`, every receipt is read repeatedly (in rounds of parallel
+threaded calls, max 5 reads each) until its reads pass **two printed-arithmetic
+identities** - `amount_paid = subtotal + rounding` and `sum(positive_lines) -
+discount_total = subtotal` (both ±HK$0.01) - **and** two reads agree on every
+field (per-field majority vote, half-cent tolerance). Reads that fail an
+identity never enter the voting pool, so a single-digit OCR error - even one
+that is internally consistent - is filtered out or outvoted; only receipts
+with genuinely ambiguous digits are sampled more often. Aggregation is done
+with `Decimal` in pure Python (Query 1 = Σ amount_paid; Query 2 = Σ subtotal +
+discount_total) and formatted as `HK$XXXX.XX`, so each response contains
+exactly one numeric amount and summation drift is impossible. Because
+aggregation is deterministic, end-to-end accuracy depends only on the
+per-receipt extraction, which the identity checks plus majority vote make
+robust across unseen receipts.
 
 ### Public test result
 
@@ -129,8 +136,12 @@ How much would I have had to pay without the discount?,HK$2348.20,correct
 ```
 
 Both public answers match `public_test/ground_truth.json` (1974.30 and
-2348.20). An offline mock test of the parsing/validation/aggregation logic
-(`test_offline.py`, no API calls) is included and passes end-to-end.
+2348.20). The result above is reproducible: it was verified on **three
+independent full runs** of the public set plus several receipt combinations
+(e.g. receipts 2+4+6, receipts 1+3+5+7, receipt 5 alone), all matching the
+per-receipt sums in `ground_truth.json`. An offline mock test of the
+parsing/validation/voting/aggregation logic (`test_offline.py`, no API calls)
+is included and passes end-to-end.
 
 ## Task 2: Reflection — how the last 10 days of AI changed my perspective
 
