@@ -77,8 +77,8 @@ def build_chain() -> Any:
     llm = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",  # required backbone model
         temperature=0.2,  # small spread so repeated reads are independent samples
-        timeout=180,
-        max_retries=3,
+        timeout=90,
+        max_retries=2,
     )
 
     system_prompt = (
@@ -283,7 +283,10 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
 
     def _read_parallel(batch_images: list[Path]) -> list[str]:
         def _read_one(image: Path) -> str:
-            return response_text(chain.invoke({"image_url": image_data_url(image)}))
+            try:
+                return response_text(chain.invoke({"image_url": image_data_url(image)}))
+            except Exception:
+                return ""  # failed read: unparseable sample, validation will retry
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             return list(pool.map(_read_one, batch_images))
