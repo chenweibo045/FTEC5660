@@ -76,7 +76,7 @@ def build_chain() -> Any:
 
     llm = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",  # required backbone model
-        temperature=0,                          # deterministic extraction
+        temperature=0.2,  # small spread so repeated reads are independent samples
         timeout=180,
         max_retries=3,
     )
@@ -103,16 +103,23 @@ def build_chain() -> Any:
         "- \"amount_paid\": the FINAL amount the customer actually paid - the payment line "
         "such as OCTOPUS / 八達通 / CASH / 現金 / VISA / MASTER / CREDIT CARD / FPS / Alipay / "
         "WeChat Pay, printed AFTER the ROUNDING line. This is the last total on the receipt.\n"
+        "- \"positive_lines\": list of EVERY positive amount printed ABOVE the SUBTOTAL line, "
+        "in order: item prices and wrapped quantity-line totals (e.g. a line like "
+        "數量： 2 $10.00 contributes 10.00), plus any fee/levy lines. Do NOT include "
+        "discounts, the SUBTOTAL itself, ROUNDING, payment, change (找續), balances, "
+        "points or card/member numbers.\n"
         "Rules:\n"
-        "1. IGNORE card numbers, member numbers, points, 積分, quantities (數量), the change "
+        "1. IGNORE card numbers, member numbers, points, 積分, the change "
         "line (找續), and the Octopus card REMAINING BALANCE line (餘額).\n"
         "2. amount_paid = subtotal_after_discounts + rounding (they must be consistent; "
         "rounding is at most a few cents).\n"
-        "3. discount_total must be >= 0.\n"
-        "4. Respond with the JSON object only, exactly in this schema:\n"
+        "3. discount_total must be >= 0 and equal the sum of the discounts list.\n"
+        "4. sum(positive_lines) - discount_total = subtotal_after_discounts (the receipt's "
+        "own printed arithmetic; if your numbers do not satisfy this, you misread a digit).\n"
+        "5. Respond with the JSON object only, exactly in this schema:\n"
         "{{\"subtotal_after_discounts\": <number>, \"discounts\": [{{\"label\": <string>, "
         "\"amount\": <number>}}], \"discount_total\": <number>, \"rounding\": <number>, "
-        "\"amount_paid\": <number>}}"
+        "\"amount_paid\": <number>, \"positive_lines\": [<number>, ...]}}"
     )
 
     prompt = ChatPromptTemplate.from_messages(
@@ -151,7 +158,8 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         raise RuntimeError("build_chain() returned None - the chain was not created.")
 
     _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-    _MAX_ATTEMPTS = 4
+    _MAX_SAMPLES = 5      # max model reads per receipt (first read + retries)
+    _AGREE_TOL = Decimal("0.005")  # two field values agree within half a cent
 
     def _to_decimal(value: Any) -> Decimal | None:
         """Coerce a model-extracted numeric field to Decimal, or None if unusable."""
@@ -163,8 +171,12 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     def _parse_extraction(text: str) -> dict[str, Decimal] | None:
         """Parse and validate one receipt's JSON extraction.
 
-        Returns {'paid': ..., 'without_discount': ...} or None when invalid.
-        Validation catches OCR mistakes early so they can be retried.
+        Returns the raw fields {'subtotal', 'discounts', 'rounding', 'paid'}
+        or None when the read is unusable. Validation rejects OCR mistakes
+        early so they never enter the voting pool. The two printed-arithmetic
+        identities (paid = subtotal + rounding, and sum of positive lines
+        minus discounts = subtotal) catch single-digit misreads that happen to
+        be internally consistent.
         """
         match = _JSON_OBJECT_RE.search(text)
         if not match:
@@ -190,36 +202,113 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         # paid must equal subtotal + rounding (within a cent of tolerance).
         if abs(paid - (subtotal + rounding)) > Decimal("0.011"):
             return None
+        # The listed discount lines must add up to the reported discount total.
+        raw_lines = data.get("discounts")
+        if isinstance(raw_lines, list):
+            line_amounts = [_to_decimal(item.get("amount") if isinstance(item, dict) else item)
+                            for item in raw_lines]
+            if None in line_amounts:
+                return None
+            if abs(sum(line_amounts, Decimal("0")) - discounts) > Decimal("0.011"):
+                return None
+        # Receipt's own printed arithmetic: every positive line above SUBTOTAL
+        # minus the discounts must reproduce the printed SUBTOTAL.
+        raw_positives = data.get("positive_lines")
+        if not isinstance(raw_positives, list):
+            return None
+        positive_amounts = [_to_decimal(item) for item in raw_positives]
+        if None in positive_amounts or not positive_amounts:
+            return None
+        if abs(sum(positive_amounts, Decimal("0")) - discounts - subtotal) > Decimal("0.011"):
+            return None
         return {
+            "subtotal": subtotal,
+            "discounts": discounts,
+            "rounding": rounding,
             "paid": paid,
-            "without_discount": subtotal + discounts,
         }
 
-    def _extract_one(image: Path) -> dict[str, Decimal]:
-        """Extract one receipt with retries; every attempt is re-read from scratch."""
-        payload = {"image_url": image_data_url(image)}
-        last_text = ""
-        for attempt in range(_MAX_ATTEMPTS):
-            response = chain.invoke(payload)
-            last_text = response_text(response)
-            parsed = _parse_extraction(last_text)
-            if parsed is not None:
-                return parsed
-        raise RuntimeError(
-            f"could not extract a valid receipt summary from {image.name}; "
-            f"last model output: {last_text[:300]!r}"
-        )
+    def _fields_agree(a: Decimal, b: Decimal) -> bool:
+        return abs(a - b) <= _AGREE_TOL
 
-    # Stage 1: extract every receipt. All images are independent, so the first
-    # pass runs in parallel with chain.batch(); only failed parses are retried.
-    payloads = [{"image_url": image_data_url(image)} for image in images]
-    first_pass = chain.batch(payloads, config={"max_concurrency": 4})
-    extracted: list[dict[str, Decimal]] = []
-    for image, response in zip(images, first_pass):
-        parsed = _parse_extraction(response_text(response))
-        if parsed is None:
-            parsed = _extract_one(image)  # retry individually
-        extracted.append(parsed)
+    def _consensus(runs: list[dict[str, Decimal]]) -> dict[str, Decimal] | None:
+        """Per-field majority vote across sampled reads of the same receipt.
+
+        A field is decided when at least two runs agree on it (half-cent
+        tolerance); the first agreeing value wins. Returns None while any
+        field still lacks a majority.
+        """
+        if not runs:
+            return None
+        consensus: dict[str, Decimal] = {}
+        for field in ("subtotal", "discounts", "rounding", "paid"):
+            winner: Decimal | None = None
+            for candidate in (run[field] for run in runs):
+                if sum(_fields_agree(candidate, other[field]) for other in runs) >= 2:
+                    winner = candidate
+                    break
+            if winner is None:
+                return None
+            consensus[field] = winner
+        return consensus
+
+    def _finalize(image: Path, runs: list[dict[str, Decimal]]) -> dict[str, Decimal]:
+        """Turn one receipt's sampled reads into a final pair of numbers.
+
+        Prefers a 2-of-N consensus; otherwise falls back to per-field
+        plurality, then to the first valid read.
+        """
+        if not runs:
+            raise RuntimeError(f"could not read receipt {image.name} after {_MAX_SAMPLES} tries")
+        agreed = _consensus(runs)
+        if agreed is None:
+            agreed = {
+                field: max(
+                    (run[field] for run in runs),
+                    key=lambda v: sum(_fields_agree(v, o[field]) for o in runs),
+                )
+                for field in ("subtotal", "discounts", "rounding", "paid")
+            }
+        if abs(agreed["paid"] - (agreed["subtotal"] + agreed["rounding"])) > Decimal("0.011"):
+            agreed = runs[0]  # mixed-run consensus broke the paid identity; trust one read
+        return {
+            "paid": agreed["paid"],
+            "without_discount": agreed["subtotal"] + agreed["discounts"],
+        }
+
+    # Stage 1: per-receipt extraction by cross-validated majority vote. Each
+    # round re-reads (in parallel threads) only the receipts that have not yet
+    # produced two agreeing validated reads, so wall time stays bounded.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _read_parallel(batch_images: list[Path]) -> list[str]:
+        def _read_one(image: Path) -> str:
+            return response_text(chain.invoke({"image_url": image_data_url(image)}))
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            return list(pool.map(_read_one, batch_images))
+
+    samples: dict[str, list[str]] = {}
+    for image, text in zip(images, _read_parallel(images)):
+        samples[image.name] = [text]
+
+    runs_map: dict[str, list[dict[str, Decimal]]] = {}
+    for _round in range(_MAX_SAMPLES - 1):
+        runs_map = {
+            name: [parsed for text in texts if (parsed := _parse_extraction(text)) is not None]
+            for name, texts in samples.items()
+        }
+        needed = [
+            image for image in images if _consensus(runs_map.get(image.name, [])) is None
+        ]
+        if not needed:
+            break
+        for image, text in zip(needed, _read_parallel(needed)):
+            samples[image.name].append(text)
+
+    extracted = [
+        _finalize(image, runs_map.get(image.name, [])) for image in images
+    ]
 
     # Stage 2: deterministic aggregation with Decimal - the LLM only reads
     # numbers off the paper; all arithmetic happens here, so no summation drift.
