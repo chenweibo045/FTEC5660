@@ -23,34 +23,8 @@ for name, r in GT["receipts"].items():
     })
 
 
-class MockChain:
-    """Mimics a LangChain Runnable: batch() + invoke() returning AIMessage-like."""
-
-    def __init__(self, behavior=None):
-        self.behavior = behavior or {}  # filename -> list of outputs (pop per call)
-        self.invocations = 0
-
-    def _reply(self, payload):
-        self.invocations += 1
-        # recover filename from the base64 payload length is unreliable; instead
-        # behavior keys are consumed round-robin by call order via a queue.
-        return None
-
-    def batch(self, payloads, config=None):
-        outs = []
-        for p in payloads:
-            outs.append(self._next())
-        return outs
-
-    def invoke(self, payload):
-        return self._next()
-
-    def _next(self):
-        raise NotImplementedError
-
-
 class QueueChain:
-    """Returns queued canned outputs; supports per-call override via queue."""
+    """Mimics a LangChain Runnable, returning queued canned text outputs."""
 
     def __init__(self, outputs):
         self.outputs = list(outputs)  # list of str (model text) to pop in order
@@ -81,7 +55,7 @@ ok = True
 images = sorted(Path("public_test").glob("receipt*.jpg"))
 outputs = ["```json\n" + CANNED[p.name] + "\n```" for p in images]  # also test fence stripping
 chain = QueueChain(outputs)
-responses = hw1.answer_queries(chain, responses := None) if False else hw1.answer_queries(chain, images)
+responses = hw1.answer_queries(chain, images)
 ok &= check("Q1 response", responses[hw1.QUERY_1] == "HK$1974.30", repr(responses[hw1.QUERY_1]))
 ok &= check("Q2 response", responses[hw1.QUERY_2] == "HK$2348.20", repr(responses[hw1.QUERY_2]))
 ok &= check("batch called once per image", chain.calls == len(images), f"calls={chain.calls}")
@@ -94,7 +68,6 @@ ok &= check("results.csv both correct", sum(1 for ln in rows.splitlines() if ln.
 print(rows)
 
 # --- Test 2: one garbage + one inconsistent answer, then valid on retry ---
-p5 = CANNED["receipt5.jpg"]
 mixed = []
 for p in images:
     if p.name == "receipt3.jpg":
@@ -105,7 +78,7 @@ for p in images:
             "rounding": -0.09, "amount_paid": 500.00}))
     else:
         mixed.append(CANNED[p.name])
-# retry queue: first the two fixes for receipt3 & receipt4 (batch order), then invokes
+# retry queue: fixes for receipt3 & receipt4 (invoked individually on failure)
 retry_fixes = [CANNED["receipt3.jpg"], CANNED["receipt4.jpg"]]
 chain2 = QueueChain(mixed + retry_fixes)
 responses2 = hw1.answer_queries(chain2, images)
